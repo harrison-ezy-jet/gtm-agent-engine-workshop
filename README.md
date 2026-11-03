@@ -20,6 +20,8 @@ cluster the failures → **Build** the fix as a PR → **Test** it against a dat
 │   ├── gtm_agent.py           # The agent graph and run_agent entrypoint
 │   ├── data_service.py        # Data access layer
 │   └── gtm_records.py         # Records / fixtures
+├── tests/
+│   └── test_gtm_agent.py      # Unit tests for the agent's tools (python -m unittest discover tests)
 ├── traces/
 │   ├── download_traces.py     # Downloads runs from a LangSmith project to traces.json
 │   ├── upload_traces.py       # Re-uploads saved traces with fresh IDs, shifted timestamps, and rep ratings
