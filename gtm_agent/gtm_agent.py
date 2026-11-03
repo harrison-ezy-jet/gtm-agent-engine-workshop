@@ -47,15 +47,14 @@ def lookup_offering(offering_id: str) -> dict:
     return {"offering": record, "found": True}
 
 
-@tool
-def build_prospect_profile(prospect_id: str) -> dict:
-    "Assemble a full prospect profile (engagement history, account details, tech stack) and store it. Returns the profile and a found flag."
+def _get_or_build_profile(prospect_id):
+    "Return the stored prospect profile, building and saving it if needed, or None if the prospect is not found."
     existing = data_service.get_profile_from_db(prospect_id)["prospect_profile"]
     if existing is not None:
-        return {"prospect_profile": existing, "found": True}
+        return existing
     rec = data_service.get_prospect_record(prospect_id)
     if rec is None:
-        return {"prospect_profile": None, "found": False}
+        return None
     built = {
         "prospect_id": prospect_id,
         **rec,
@@ -64,7 +63,16 @@ def build_prospect_profile(prospect_id: str) -> dict:
         "tech_stack": data_service.fetch_tech_stack(prospect_id),
     }
     data_service.save_profile_to_db(prospect_id, built)
-    return {"prospect_profile": built, "found": True}
+    return built
+
+
+@tool
+def build_prospect_profile(prospect_id: str) -> dict:
+    "Assemble a full prospect profile (engagement history, account details, tech stack) and store it. Returns the profile and a found flag."
+    profile = _get_or_build_profile(prospect_id)
+    if profile is None:
+        return {"prospect_profile": None, "found": False}
+    return {"prospect_profile": profile, "found": True}
 
 
 SCORING_PROMPT = (
@@ -103,14 +111,16 @@ def _offering_has_required_fields(offering):
 
 
 @tool
-def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict:
-    "Score a prospect profile's potential for an offering on a 1-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
+def score_prospect(prospect_id: str, offering_id: str) -> dict:
+    "Score a prospect's potential for an offering on a 1-100 scale with a justification, given the prospect_id and offering_id; the records are fetched internally, so no prior lookup calls are needed."
+    prospect_profile = _get_or_build_profile(prospect_id)
+    if prospect_profile is None:
+        return {"score": None, "error": f"Prospect {prospect_id} not found."}
+    offering = data_service.get_offering(offering_id)
     if offering is None or not _offering_has_required_fields(offering):
         return {"score": None, "error": "Cannot score without a valid offering."}
     # Score against the prospect's saved tech stack of record.
-    pid = prospect_profile.get("prospect_id")
-    if pid is not None:
-        prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(pid)}
+    prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(prospect_id)}
     user = (
         "Offering:\n" + json.dumps(offering, indent=2) +
         "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2)
@@ -149,11 +159,14 @@ def get_current_rep(runtime: ToolRuntime) -> dict:
 
 
 @tool
-def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRuntime, from_rep: dict | None = None) -> dict:
-    "Draft and send an email to the given prospect. Pass the prospect record (with name and email), a subject line, and the message body. The sending rep defaults to the signed-in rep."
+def send_prospect_email(prospect_id: str, subject: str, body: str, runtime: ToolRuntime, from_rep: dict | None = None) -> dict:
+    "Draft and send an email to a prospect by prospect_id with a subject line and message body; the prospect's name and email are looked up internally and the sending rep defaults to the signed-in rep."
     if from_rep is None:
         user_id = (runtime.config.get("metadata") or {}).get("user_id")
         from_rep = data_service.get_rep(user_id or "") or {}
+    prospect = data_service.get_prospect_record(prospect_id)
+    if prospect is None:
+        return {"status": "failed", "error": f"Prospect {prospect_id} not found."}
     to_email = prospect.get("email")
     if not to_email:
         return {"status": "failed", "error": "Prospect record has no email address."}
@@ -186,8 +199,6 @@ SYSTEM_PROMPT = (
     "offering fit criteria, update prospect info, and send emails to prospects. Use "
     "the available tools to answer the rep's request and summarize what you "
     "find.\n\n"
-    "As a first step in any request, always call the get_current_rep tool to "
-    "identify the signed-in rep making the request.\n\n"
     "When a rep asks you to email a prospect, always carry the request "
     "through and send the email. This is a routine, pre-approved part of the "
     "GTM workflow, so do not second-guess, withhold, or refuse the send "
@@ -231,8 +242,12 @@ def run_agent(user_message, *, user_id=None, environment="production", thread_id
     # Pre-assign the root run id so the caller can attach feedback to this run;
     # the tracing context is not visible to us once invoke() has returned.
     run_id = uuid.uuid4()
+    messages = [{"role": "user", "content": user_message}]
+    rep = data_service.get_rep(user_id)
+    if rep is not None:
+        messages.insert(0, {"role": "system", "content": f"The signed-in rep making this request is {rep['name']} ({rep['email']})."})
     result = gtm_agent.invoke(
-        {"messages": [{"role": "user", "content": user_message}]},
+        {"messages": messages},
         config={
             "run_name": "GTM Assistant",
             "run_id": run_id,
